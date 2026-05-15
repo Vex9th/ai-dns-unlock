@@ -84,6 +84,16 @@ if [[ -z "$PUB_IP" ]]; then
     [[ -n "$PUB_IP" ]] || die "公网 IP 探测失败,请在脚本顶部 PUB_IP 变量手填"
 fi
 
+# 校验 PUB_IP 是否真的绑在本机网卡上 —— dnsmasq 的 bind-interfaces + listen-address
+# 需要该 IP 直接存在于某块网卡;NAT/云浮动 IP 场景探测出的出口 IP 可能不在网卡上
+if ! ip -4 addr show 2>/dev/null | grep -qw "$PUB_IP"; then
+    warn "公网 IP $PUB_IP 不在本机任何网卡上(NAT / 云浮动 IP?)"
+    warn "dnsmasq listen-address 需要 IP 直接绑在网卡上,否则会启动失败"
+    warn "若确认是出口 IP 但走 NAT:把网卡上的内网 IP 填进 PUB_IP 变量,或在云控制台直绑公网 IP"
+    read -rp "仍要用 $PUB_IP 继续吗? [y/N] " _ans
+    [[ "$_ans" == [yY] ]] || die "已中止;请修正 PUB_IP 后重跑"
+fi
+
 # =============== 安装依赖 ===============
 log "安装 dnsmasq / sniproxy / iptables-persistent / ipset..."
 export DEBIAN_FRONTEND=noninteractive
@@ -94,15 +104,14 @@ echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debcon
 if [[ -e /etc/resolv.conf && ! -e /etc/resolv.conf.bak.ai-unlock ]]; then
     cp -a /etc/resolv.conf /etc/resolv.conf.bak.ai-unlock 2>/dev/null || true
 fi
-RESOLV_BEFORE=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
-RESOLV_SUM_BEFORE=$(md5sum /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+RESOLV_SUM_BEFORE=$(md5sum /etc/resolv.conf 2>/dev/null | awk '{print $1}' || true)
 
 apt-get install -y -q dnsmasq sniproxy curl ipset iptables-persistent ca-certificates
 # 安装后 dnsmasq 用默认配置启动可能冲突 systemd-resolved,先停下,等配置写完再启
 systemctl stop dnsmasq 2>/dev/null || true
 
 # 如果 dnsmasq 包改了 /etc/resolv.conf 把它指回了 127.0.0.1(部分系统),恢复
-RESOLV_SUM_AFTER=$(md5sum /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+RESOLV_SUM_AFTER=$(md5sum /etc/resolv.conf 2>/dev/null | awk '{print $1}' || true)
 if [[ "$RESOLV_SUM_AFTER" != "$RESOLV_SUM_BEFORE" ]] && grep -qE '^nameserver\s+127\.' /etc/resolv.conf 2>/dev/null; then
     warn "dnsmasq 包安装时改写了 /etc/resolv.conf 指向 127.x,恢复中..."
     [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
@@ -190,44 +199,45 @@ systemctl enable dnsmasq >/dev/null 2>&1 || true
 # 语法依据: Debian 12 sniproxy 包(dlundquist/sniproxy 0.6.x)的 sniproxy.conf(5) manpage
 log "生成 $SNIPROXY_CONF ..."
 mkdir -p /var/log/sniproxy
-cat > "$SNIPROXY_CONF" <<EOF
-# Managed by deploy-unlocker.sh — DO NOT EDIT BY HAND
-# Generated: $(date -Is)
-
-username daemon
-pidfile /var/run/sniproxy.pid
-
-error_log {
-    syslog daemon
-    priority notice
-}
-
-resolver {
-    nameserver $(echo "$UPSTREAM_DNS" | awk '{print $1}')
-    nameserver $(echo "$UPSTREAM_DNS" | awk '{print $2}')
-    mode ipv4_only
-}
-
-listener 0.0.0.0:80 {
-    protocol http
-    table https_hosts
-    access_log {
-        filename /var/log/sniproxy/http_access.log
-    }
-}
-
-listener 0.0.0.0:443 {
-    protocol tls
-    table https_hosts
-    access_log {
-        filename /var/log/sniproxy/https_access.log
-    }
-}
-
-table https_hosts {
-    .* *
-}
-EOF
+{
+    echo "# Managed by deploy-unlocker.sh — DO NOT EDIT BY HAND"
+    echo "# Generated: $(date -Is)"
+    echo
+    echo "username daemon"
+    echo "pidfile /var/run/sniproxy.pid"
+    echo
+    echo "error_log {"
+    echo "    syslog daemon"
+    echo "    priority notice"
+    echo "}"
+    echo
+    echo "resolver {"
+    for u in $UPSTREAM_DNS; do
+        echo "    nameserver $u"
+    done
+    echo "    mode ipv4_only"
+    echo "}"
+    echo
+    echo "listener 0.0.0.0:80 {"
+    echo "    protocol http"
+    echo "    table https_hosts"
+    echo "    access_log {"
+    echo "        filename /var/log/sniproxy/http_access.log"
+    echo "    }"
+    echo "}"
+    echo
+    echo "listener 0.0.0.0:443 {"
+    echo "    protocol tls"
+    echo "    table https_hosts"
+    echo "    access_log {"
+    echo "        filename /var/log/sniproxy/https_access.log"
+    echo "    }"
+    echo "}"
+    echo
+    echo "table https_hosts {"
+    echo "    .* *"
+    echo "}"
+} > "$SNIPROXY_CONF"
 ok "sniproxy 配置写入完成"
 
 # Debian 包默认 ENABLED=0,改成 1
@@ -277,7 +287,7 @@ ok "iptables 规则已下发并持久化"
 cat > /etc/systemd/system/ipset-restore.service <<EOF
 [Unit]
 Description=Restore ipset before iptables-persistent
-DefaultDependencies=no
+After=local-fs.target
 Wants=netfilter-persistent.service
 Before=netfilter-persistent.service
 

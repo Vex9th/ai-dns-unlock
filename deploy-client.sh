@@ -152,7 +152,9 @@ fi
     echo "# Managed by deploy-client.sh — DO NOT EDIT BY HAND"
     echo "# Generated: $(date -Is)"
     echo
-    echo "bind 127.0.0.1:53"
+    # -force-https-soa: 对所有查询的 HTTPS RR(type65)返 SOA,防 ECH 加密 ClientHello
+    # (这是 bind 指令的合法选项;全局屏蔽 type65 无副作用,浏览器会 fallback 到 A 查询)
+    echo "bind 127.0.0.1:53 -force-https-soa"
     echo "cache-size 32768"
     echo "cache-persist yes"
     echo "cache-file /var/cache/smartdns/cache.bin"
@@ -181,7 +183,7 @@ ok "主配置写入完成"
 # =============== 写 ai.conf ===============
 # - nameserver: 把 AI 域名指向 ai-unlock 组
 # - address /d/#6: 对 AI 域名的 AAAA 查询返 SOA(NODATA),阻断 IPv6 绕过
-# - domain-rules -force-https-soa: 对 AI 域名的 HTTPS RR(type 65)返 SOA,阻断 ECH
+# (type65/ECH 的屏蔽由主配置 bind ... -force-https-soa 全局处理,这里不重复)
 log "生成 $AI_CONF ..."
 {
     echo "# Managed by deploy-client.sh — DO NOT EDIT BY HAND"
@@ -197,11 +199,6 @@ log "生成 $AI_CONF ..."
     for d in "${DOMAINS[@]}"; do
         echo "address /${d}/#6"
     done
-    echo
-    echo "# 屏蔽 HTTPS RR / ECH(按域名生效)"
-    for d in "${DOMAINS[@]}"; do
-        echo "domain-rules /${d}/ -force-https-soa"
-    done
 } > "$AI_CONF"
 ok "ai.conf 写入完成"
 
@@ -212,7 +209,8 @@ log "接管系统 DNS..."
 free_port_53() {
     local pids name exe
     # 取所有占 53 的 pid(去重)
-    pids=$(ss -lntup 2>/dev/null | awk '$5 ~ /:53$/' | grep -oP 'pid=\K[0-9]+' | sort -u)
+    # 末尾 || true 必须有:无监听时 grep 无匹配返回非 0,pipefail+set -e 会让裸赋值终止整个脚本
+    pids=$(ss -lntup 2>/dev/null | awk '$5 ~ /:53$/' | grep -oP 'pid=\K[0-9]+' | sort -u || true)
     [[ -z "$pids" ]] && return 0
 
     for pid in $pids; do
@@ -222,17 +220,17 @@ free_port_53() {
             smartdns) ;;  # 是我们自己上一轮跑剩的,后面 restart 会接管
             systemd-resolved)
                 log "停 systemd-resolved (占 53)"
-                systemctl stop systemd-resolved
+                systemctl stop systemd-resolved || true
                 systemctl disable systemd-resolved >/dev/null 2>&1 || true
                 ;;
             AdGuardHome)
                 log "停 AdGuardHome (占 53)"
-                "$exe" -s stop 2>/dev/null || systemctl stop AdGuardHome 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+                "$exe" -s stop 2>/dev/null || systemctl stop AdGuardHome 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
                 systemctl disable AdGuardHome >/dev/null 2>&1 || true
                 ;;
             dnsmasq|unbound|named|pdns_recursor|pdns_server|pihole-FTL|coredns)
                 log "停 $name (占 53)"
-                systemctl stop "$name" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+                systemctl stop "$name" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
                 systemctl disable "$name" >/dev/null 2>&1 || true
                 ;;
             *)
@@ -297,7 +295,7 @@ ${BLU}验证命令:${RST}
   curl -v https://chat.openai.com/
 
 ${BLU}临时摘掉某个解锁机:${RST}
-  sudo sed -i 's|^server <IP> -group ai-unlock|#&|' ${SMARTDNS_CONF}
-  sudo systemctl reload smartdns
+  sed -i 's|^server <IP> -group ai-unlock|#&|' ${SMARTDNS_CONF}
+  systemctl reload smartdns
   # 或者直接重跑本脚本,只填留下的那些 IP(更稳)。
 EOF
